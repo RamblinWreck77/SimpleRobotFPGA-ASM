@@ -1,0 +1,705 @@
+ORG        &H000       ;Begin program at x000
+;***************************************************************
+;* Initialization
+;***************************************************************
+Init:
+	; Always a good idea to make sure the robot
+	; stops in the event of a reset.
+	LOAD   Zero
+	OUT    LVELCMD     ; Stop motors
+	OUT    RVELCMD
+	OUT    SONAREN     ; Disable sonar (optional)
+	CALL   SetupI2C    ; Configure the I2C to read the battery voltage
+	CALL   BattCheck   ; Get battery voltage (and end if too low).
+	;OUT    LCD         ; Display batt voltage on LCD
+
+
+WaitForSafety:
+	; Wait for safety switch to be toggled
+	IN     XIO         ; XIO contains SAFETY signal
+	AND    Mask4       ; SAFETY signal is bit 4
+	JPOS   WaitForUser ; If ready, jump to wait for PB3
+	IN     TIMER       ; We'll use the timer value to
+	AND    Mask1       ;  blink LED17 as a reminder to toggle SW17
+	SHIFT  8           ; Shift over to LED17
+	OUT    XLEDS       ; LED17 blinks at 2.5Hz (10Hz/4)
+	JUMP   WaitForSafety
+	
+WaitForUser:
+	; Wait for user to press PB3
+	IN     TIMER       ; We'll blink the LEDs above PB3
+	AND    Mask1
+	SHIFT  5           ; Both LEDG6 and LEDG7
+	STORE  Temp        ; (overkill, but looks nice)
+	SHIFT  1
+	OR     Temp
+	OUT    XLEDS
+	IN     XIO         ; XIO contains KEYs
+	AND    Mask2       ; KEY3 mask (KEY0 is reset and can't be read)
+	JPOS   WaitForUser ; not ready (KEYs are active-low, hence JPOS)
+	LOAD   Zero
+	OUT    XLEDS       ; clear LEDs once ready to continue
+	LOAD   Zero
+	STORE	Corr
+	STORE	C
+	STORE	D
+	STORE   CCounter
+
+
+
+;***************************************************************
+;* Main code
+;***************************************************************
+Main:
+			DIVN		NUM
+			DIVD		DEN
+			QUOT  		0
+			STORE		A
+			LOAD		A
+
+			SUB			CHECK1
+			JNEG		B1&2
+			ADD 		CHECK1
+			SUB			CHECK2
+			JNEG		B2&3
+			ADD 		CHECK2
+			JUMP 		B3&4
+
+B1&2:		MULTA		A
+			MULTB		C12
+			MULTP		0	
+			STORE		A	
+			OUT			resetpos
+			JUMP		BOT
+
+B2&3:		LOAD		A
+			SUB			LUT5
+			STORE		B
+			MULTA		B
+			MULTB		C23
+			MULTP		0
+			ADD			LUT1
+			;JUMP		TEST
+			
+B3&4:		LOAD		A
+			SUB			LUT6
+			STORE		B
+			MULTA		B
+			MULTB		C34
+			MULTP		0
+			ADD			LUT2
+			;JUMP		TEST
+			
+			
+			;;; ARCTAN CODE NEEDS TO RUN BEFORE THIS LINE AND STORE VALUES IN THE A1-3 and P1-3
+; INIT
+BOT:	
+			LOAD		Zero			; INIT, set global position and go from here
+			OUT			RVELCMD
+			OUT			LVELCMD
+			OUT			RESETPOS		; Reset Position Data
+			LOAD 		Corr
+			OUT			LCD
+			JUMP		UpdateCommands	; Skip think for the first travel	
+; This figures out which loop we are on and defintes PNow and ANow as the right P1-3 & A1-3 values				
+UpdateCommands:
+;;			Runs every loop
+			LOAD		CCounter		; Current loop value, starts at 1
+			ADDI		1				; Tick up
+			STORE		CCounter		; Save the loop number
+			IN			XPOS
+			STORE		Xtemp			; Each loop store the starting coords
+			IN			YPOS			; Init should be (0,0)
+			STORE		Ytemp			
+;;
+			; Loop 1
+			LOAD		CCounter		; Fetch Loop number
+			ADDI		-1				
+			JZERO		FirstLoop		; IF first loop
+			;
+			; Loop 2
+			LOAD		CCounter		; Fetch Loop number
+			ADDI		-2				
+			JZERO		SecondLoop		; IF first loop
+			;
+			; Loop 3
+			LOAD		CCounter		; Fetch Loop number
+			ADDI		-3			
+			JZERO		ThirdLoop		; IF first loop
+			; Loop 4
+			LOAD		CCounter		; Fetch Loop number
+			ADDI		-4			
+			JZERO		FourthLoop		; IF first loop
+			JUMP		Die				; IF we are past loop 3 DIE				<<< END program code
+			;
+;This Updates PNow and ANow with the right valeus
+FirstLoop:
+			LOAD 		P1
+			STORE		PNow
+			LOAD		A1
+			STORE		ANow
+			JUMP		StartForward		
+SecondLoop:
+			LOAD 		P2
+			STORE		PNow
+			LOAD		A2
+			STORE		ANow
+			JUMP		StartForward
+ThirdLoop:		
+			LOAD 		P3
+			STORE		PNow
+			LOAD		A3
+			STORE		ANow
+			JUMP		StartForward
+FourthLoop:		
+			LOAD 		P4
+			STORE		PNow
+			LOAD		A4
+			STORE		ANow
+			JUMP		StartForward
+			
+;;; BEGIN move forward code
+StartForward:							; Now that we have a correct course to hold, lets roll
+			; Aligned to vector
+			LOAD		FMid2			; Initial go-forward
+			OUT			RVELCMD
+			OUT			LVELCMD
+			;IN			XPOS		; Keep going forward until we reach the desired XPOS
+			;OUT			LEDS
+			;OUT			SSEG2	; OUT current on 4-digit SevenSeg
+;;; BEGIN course seeking section
+GetAngle:
+			IN     		THETA       ; Pull the angle in and correct it for our current course
+			SUB			Corr		; Add the shift value for this turn (-90)P ==270 Theta,
+			JNEG		OverCorr	; Correction needs Remap -> 0...359
+			JPOS		GoodCorr	; Correction was fine
+			JZERO		ContForward
+; ADJUST COURSE CORRECTION SO IT ALWAYS maps to 0-359
+OverCorr:
+			ADDI		360			;; remap -1 to 359
+			JUMP		GoodCorr
+; CHECK if we are LEFT or RIGHT of center
+GoodCorr:							;[0..359]
+			ADDI		-180
+			JPOS		DeadTestRight	;Deadzone Test since we were right of course
+			JNEG		DeadTestLeft	;Deadzone Test since we were left of course
+			; JZERO 		??
+; DEAD ZONE TEST
+DeadTestRight:
+			ADDI		-180			; Complete the map to 2,1,0,-1,-2 from [0..359]
+			ADD			Deadzone
+			JPOS		ContForward
+			JZERO		ContForward			;;Was within Deadzone of course
+			JNEG		FixDeadTestRight					; Was NOT -----
+DeadTestLeft:
+			ADDI		180	;[0-180] before was sent negative by GoodCorr, UNDO this
+			SUB			Deadzone
+			JNEG		ContForward			;;Was within Deadzone of course
+			JZERO		ContForward		
+			JPOS		FixDeadTestLeft					; Was NOT -----
+;; OUTSIDE DEAD ZONE, SO DO SOMETHING ABOUT IT
+;; Dead zone testing modified our values for testing, reverses the dead zone changes
+FixDeadTestRight:
+			SUB			Deadzone
+			JUMP		FixerD
+FixDeadTestLeft:
+			ADD			Deadzone
+			JUMP		FixerD
+;; EMD DEAD ZONE TEST
+;;	NOW in fixer D our directio should be mapped 2,1,0,-1,-2
+FixerD:
+			JNEG		AngleLeft  ; (-)269-270==-1 robot is right of course GO LEFT
+			JPOS		AngleRight ; (+)271-270 == +1 Robot is left of course GO RIGHT
+AngleLeft:							; Set Left drift 
+			LOAD		One
+			OUT			SSEG1         ;State Display Info
+			LOAD		Corr
+			OUT			LCD
+			IN			THETA
+			OUT			SSEG2
+			;
+			LOAD   		Fslow		; slow down the left wheel so that we angle that way
+			OUT	   		LVELCMD
+			LOAD   		FMid2
+			OUT	   		RVELCMD
+			;
+			JUMP		GetAngle
+AngleRight:							; Set Right Drift
+			LOAD		Two
+			OUT			SSEG1         ;State Display Info
+			LOAD		Corr
+			OUT			LCD
+			IN			THETA
+			OUT			SSEG2
+			;
+			LOAD   		Fslow		; slow down the right wheel so that we angle that way
+			OUT	  		RVELCMD
+			LOAD  		FMid2
+			OUT	   		LVELCMD
+			;
+			JUMP		GetAngle
+; END angle-correction code BASED on course during forward movement
+;;; KEEP GOING CODE
+ContForward:
+			LOAD		Three
+			OUT			SSEG1
+			LOAD		Corr
+			OUT			LCD
+			LOAD 		FMid2
+			OUT			RVELCMD
+			OUT			LVELCMD
+			;; KEEP GOING CODE
+			; Get deltas
+			IN			XPOS		; Get differences bewteen Starting coords and current
+			SUB			Xtemp
+			STORE		Delta1
+			IN			YPOS
+			SUB			Ytemp
+			STORE		Delta2		; Store the deltas for both
+			; Make Deltas Positive
+			LOAD		Delta1
+			JNEG		Delta1Fix
+			JPOS		Delta2Check
+			JZERO		Delta2Check
+Delta1Fix:
+			LOAD		Delta1
+			SUB			Delta1
+			SUB			Delta1
+			STORE		Delta1
+Delta2Check:			
+			LOAD		Delta2
+			JNEG		Delta2Fix
+			JPOS		DeltasGood
+			JZERO		DeltasGood
+Delta2Fix:
+			LOAD		Delta2
+			SUB			Delta2
+			SUB			Delta2
+			STORE		Delta2
+			;
+DeltasGood:
+			LOAD		Delta1
+			ADD			Delta2
+			OUT			LEDS
+			ADD			ANow			; How far to go forward by (negative value)
+			JNEG		StartForward
+			JZERO		Decide			; XPOS-Anow==0 or positive we've gone far enough
+			JPOS 		Decide
+			;;
+;;; KEEP GOING CODE ^^^^
+; Begin next travel segment, aka turn then go
+Decide:								;STOP, RESET, and DECIDE which way to turn
+			LOAD		Zero				
+			OUT			RVELCMD
+			OUT			LVELCMD			; ALL STOP
+			LOAD 		PNow
+			JPOS		CourseUpdateLeft	;(+P) This is where we take P (ordered turn value) and 
+			JNEG		CourseUpdateRight	;(-P) Update our commanded course value
+			JZERO		TurnCompleted
+;Update Course BEFORE turning			>>>>>>>>>>>>>>>>>>>>> debug got to here
+CourseUpdateLeft:		;(+P)
+			LOAD		Corr
+			ADD			PNow	; first: 0+N
+			ADDI		-360 		; here we're testing if we went around, say THETA=350 and P==90 (left)
+			STORE		Corr
+			JPOS		TurnLeft
+			JZERO		TurnLeft
+			;JPOS		Hold
+			ADDI		360		; IF the result wasn't positive undo the -360
+			STORE		Corr
+			JUMP		TurnLeft	; we had a good value, jump to turn left
+			;JUMP		Hold
+CourseUpdateRight:		;(-P)
+			LOAD		Corr
+			ADD			PNow
+			STORE		Corr	
+			JPOS		TurnRight	; did N+(-P) stay postive? Then it's  good value go ahead and turn
+			;JPOS		Hold
+			ADDI		360			; IF N+(-P) went negative correct the value
+			STORE		Corr
+			JUMP		TurnRight	; we had a good value, jump to turn left
+			;JUMP		Hold
+
+; Begin ACTUAL TURN CODE
+;Method: keep turning until THETA is within 2 degrees of the course value	
+;LEFT TURN		
+TurnLeft:								
+			LOAD 		Fslow
+			OUT			RVELCMD ; Start Turning
+			IN			THETA	; Load THETA
+			;OUT			SSEG2	; OUT current THETA on 4-digit SevenSeg
+			SUB			Corr
+			; Now parse result. We want to stop turning once THETA is within DEADZONE of Corr
+			JNEG		NegTestLeft
+			JPOS 		PosTestLeft
+			JZERO		TurnCompleted				; STOP TURRNING
+NegTestLeft:
+			ADD			DeadZone
+			JZERO		TurnCompleted				; STOP TURNING
+			JPOS		TurnCompleted				; STOP TURNING
+			JNEG		TurnLeft
+PosTestLeft:
+			SUB			DeadZone
+			JZERO		TurnCompleted				; STOP TURNING
+			JNEG		TurnCompleted				; STOP TURNING
+			JPOS		TurnLeft		
+;RIGHT TURN
+TurnRight:
+			LOAD 		Fslow
+			OUT			LVELCMD ; Start Turning
+			IN			THETA	; Load THETA
+			;OUT			SSEG2	; OUT current on 4-digit SevenSeg
+			SUB			Corr
+			; Now parse result. We want to stop turning once THETA is within DEADZONE of Corr
+			JNEG		NegTestRight
+			JPOS 		PosTestRight
+			JZERO		TurnCompleted				; STOP TURRNING
+NegTestRight:
+			ADD			DeadZone
+			JZERO		TurnCompleted				; STOP TURNING
+			JPOS		TurnCompleted				; STOP TURNING
+			JNEG		TurnRight
+PosTestRight:
+			SUB			DeadZone
+			JZERO		TurnCompleted				; STOP TURNING
+			JNEG		TurnCompleted				; STOP TURNING
+			JPOS		TurnRight		
+;;;
+TurnCompleted:
+			;OUT			RESETPOS
+			LOAD		Zero
+			OUT			RVELCMD
+			OUT			LVELCMD			;; ALL STOP
+			JUMP		UpdateCommands	
+; END ACTUAL TURN CODE	
+
+; Hold:
+; 	LOAD 		Corr
+; 	OUT			LCD
+; 	LOAD		CCounter
+; 	OUT			SSEG1
+; 	JUMP		Hold
+
+
+	
+Die:
+; Sometimes it's useful to permanently stop execution.
+; This will also catch the execution if it accidentally
+; falls through from above.
+	LOAD   Zero         ; Stop everything.
+	OUT    LVELCMD
+	OUT    RVELCMD
+	OUT    SONAREN
+	LOAD   DEAD         ; An indication that we are dead
+	OUT    SSEG2
+Forever:
+	JUMP   Forever      ; Do this forever.
+	DEAD:  DW &HDEAD    ; Example of a "global variable"
+
+	
+;***************************************************************
+;* Subroutines
+;***************************************************************
+
+; Subroutine to wait (block) for 1 second
+Wait1:
+	OUT    TIMER
+Wloop:
+	IN     TIMER
+	OUT    XLEDS       ; User-feedback that a pause is occurring.
+	ADDI   -10         ; 1 second in 10Hz.
+	JNEG   Wloop
+	RETURN
+
+; Subroutine to wait the number of timer counts currently in AC
+WaitAC:
+	STORE  WaitTime
+	OUT    Timer
+WACLoop:
+	IN     Timer
+	OUT    XLEDS       ; User-feedback that a pause is occurring.
+	SUB    WaitTime
+	JNEG   WACLoop
+	RETURN
+	WaitTime: DW 0     ; "local" variable.
+	
+; This subroutine will get the battery voltage,
+; and stop program execution if it is too low.
+; SetupI2C must be executed prior to this.
+BattCheck:
+	CALL   GetBattLvl
+	JZERO  BattCheck   ; A/D hasn't had time to initialize
+	SUB    MinBatt
+	JNEG   DeadBatt
+	ADD    MinBatt     ; get original value back
+	RETURN
+; If the battery is too low, we want to make
+; sure that the user realizes it...
+DeadBatt:
+	LOAD   Four
+	OUT    BEEP        ; start beep sound
+	CALL   GetBattLvl  ; get the battery level
+	OUT    SSEG1       ; display it everywhere
+	OUT    SSEG2
+	OUT    LCD
+	LOAD   Zero
+	ADDI   -1          ; 0xFFFF
+	OUT    LEDS        ; all LEDs on
+	OUT    XLEDS
+	CALL   Wait1       ; 1 second
+	Load   Zero
+	OUT    BEEP        ; stop beeping
+	LOAD   Zero
+	OUT    LEDS        ; LEDs off
+	OUT    XLEDS
+	CALL   Wait1       ; 1 second
+	JUMP   DeadBatt    ; repeat forever
+	
+; Subroutine to read the A/D (battery voltage)
+; Assumes that SetupI2C has been run
+GetBattLvl:
+	LOAD   I2CRCmd     ; 0x0190 (write 0B, read 1B, addr 0x90)
+	OUT    I2C_CMD     ; to I2C_CMD
+	OUT    I2C_RDY     ; start the communication
+	CALL   BlockI2C    ; wait for it to finish
+	IN     I2C_DATA    ; get the returned data
+	RETURN
+
+; Subroutine to configure the I2C for reading batt voltage
+; Only needs to be done once after each reset.
+SetupI2C:
+	CALL   BlockI2C    ; wait for idle
+	LOAD   I2CWCmd     ; 0x1190 (write 1B, read 1B, addr 0x90)
+	OUT    I2C_CMD     ; to I2C_CMD register
+	LOAD   Zero        ; 0x0000 (A/D port 0, no increment)
+	OUT    I2C_DATA    ; to I2C_DATA register
+	OUT    I2C_RDY     ; start the communication
+	CALL   BlockI2C    ; wait for it to finish
+	RETURN
+	
+; Subroutine to block until I2C device is idle
+BlockI2C:
+	LOAD   Zero
+	STORE  Temp        ; Used to check for timeout
+BI2CL:
+	LOAD   Temp
+	ADDI   1           ; this will result in ~0.1s timeout
+	STORE  Temp
+	JZERO  I2CError    ; Timeout occurred; error
+	IN     I2C_RDY     ; Read busy signal
+	JPOS   BI2CL       ; If not 0, try again
+	RETURN             ; Else return
+I2CError:
+	LOAD   Zero
+	ADDI   &H12C       ; "I2C"
+	OUT    SSEG1
+	OUT    SSEG2       ; display error message
+	JUMP   I2CError
+
+; Subroutine to send AC value through the UART,
+; formatted for default base station code:
+; [ AC(15..8) | AC(7..0)]
+; Note that special characters such as \lf are
+; escaped with the value 0x1B, thus the literal
+; value 0x1B must be sent as 0x1B1B, should it occur.
+UARTSend:
+	STORE  UARTTemp
+	SHIFT  -8
+	ADDI   -27   ; escape character
+	JZERO  UEsc1
+	ADDI   27
+	OUT    UART_DAT
+	JUMP   USend2
+UEsc1:
+	ADDI   27
+	OUT    UART_DAT
+	OUT    UART_DAT
+USend2:
+	LOAD   UARTTemp
+	AND    LowByte
+	ADDI   -27   ; escape character
+	JZERO  UEsc2
+	ADDI   27
+	OUT    UART_DAT
+	RETURN
+UEsc2:
+	ADDI   27
+	OUT    UART_DAT
+	OUT    UART_DAT
+	RETURN
+	UARTTemp: DW 0
+
+; Subroutine to send a newline to the computer log
+UARTNL:
+	LOAD   NL
+	OUT    UART_DAT
+	SHIFT  -8
+	OUT    UART_DAT
+	RETURN
+	NL: DW &H0A1B
+
+; Subroutine to clear the internal UART receive FIFO.
+UARTClear:
+	IN     UART_DAT
+	JNEG   UARTClear
+	RETURN
+;***************************************************************
+;* Variables
+;***************************************************************
+Temp:     DW 0 ; "Temp" is not a great name, but can be useful
+
+;***************************************************************
+;* Constants
+;* (though there is nothing stopping you from writing to these)
+;***************************************************************
+NegOne:   DW -1
+Zero:     DW 0
+One:      DW 1
+Two:      DW 2
+Three:    DW 3
+Four:     DW 4
+Five:     DW 5
+Six:      DW 6
+Seven:    DW 7
+Eight:    DW 8
+Nine:     DW 9
+Ten:      DW 10
+Range:	  DW 180
+
+; Some bit masks.
+; Masks of multiple bits can be constructed by ORing these
+; 1-bit masks together.
+Mask0:    DW &B00000001
+Mask1:    DW &B00000010
+Mask2:    DW &B00000100
+Mask3:    DW &B00001000
+Mask4:    DW &B00010000
+Mask5:    DW &B00100000
+Mask6:    DW &B01000000
+Mask7:    DW &B10000000
+LowByte:  DW &HFF      ; binary 00000000 1111111
+LowNibl:  DW &HF       ; 0000 0000 0000 1111
+
+; some useful movement values
+OneMeter: DW 961       ; ~1m in 1.05mm units
+HalfMeter: DW 481      ; ~0.5m in 1.05mm units
+TwoFeet:  DW 586       ; ~2ft in 1.05mm units
+Deg90:    DW 90        ; 90 degrees in odometer units
+Deg180:   DW 180       ; 180
+Deg270:   DW 270       ; 270
+Deg360:   DW 360       ; can never actually happen; for math only
+FSlow:    DW 100       ; 100 is about the lowest velocity value that will move
+RSlow:    DW -100
+FMid2:    DW 140       ; 350 is a medium speed
+FMid:     DW 350       ; 350 is a medium speed
+RMid:     DW -350
+FFast:    DW 500       ; 500 is almost max speed (511 is max)
+RFast:    DW -500
+
+MinBatt:  DW 130       ; 13.0V - minimum safe battery voltage
+I2CWCmd:  DW &H1190    ; write one i2c byte, read one byte, addr 0x90
+I2CRCmd:  DW &H0190    ; write nothing, read one byte, addr 0x90
+
+;***************************************************************
+;* IO address space map
+;***************************************************************
+SWITCHES: EQU &H00  ; slide switches
+LEDS:     EQU &H01  ; red LEDs
+TIMER:    EQU &H02  ; timer, usually running at 10 Hz
+XIO:      EQU &H03  ; pushbuttons and some misc. inputs
+SSEG1:    EQU &H04  ; seven-segment display (4-digits only)
+SSEG2:    EQU &H05  ; seven-segment display (4-digits only)
+LCD:      EQU &H06  ; primitive 4-digit LCD display
+XLEDS:    EQU &H07  ; Green LEDs (and Red LED16+17)
+BEEP:     EQU &H0A  ; Control the beep
+CTIMER:   EQU &H0C  ; Configurable timer for interrupts
+LPOS:     EQU &H80  ; left wheel encoder position (read only)
+LVEL:     EQU &H82  ; current left wheel velocity (read only)
+LVELCMD:  EQU &H83  ; left wheel velocity command (write only)
+RPOS:     EQU &H88  ; same values for right wheel...
+RVEL:     EQU &H8A  ; ...
+RVELCMD:  EQU &H8B  ; ...
+I2C_CMD:  EQU &H90  ; I2C module's CMD register,
+I2C_DATA: EQU &H91  ; ... DATA register,
+I2C_RDY:  EQU &H92  ; ... and BUSY register
+UART_DAT: EQU &H98  ; UART data
+UART_RDY: EQU &H98  ; UART status
+SONAR:    EQU &HA0  ; base address for more than 16 registers....
+DIST0:    EQU &HA8  ; the eight sonar distance readings
+DIST1:    EQU &HA9  ; ...
+DIST2:    EQU &HAA  ; ...
+DIST3:    EQU &HAB  ; ...
+DIST4:    EQU &HAC  ; ...
+DIST5:    EQU &HAD  ; ...
+DIST6:    EQU &HAE  ; ...
+DIST7:    EQU &HAF  ; ...
+SONALARM: EQU &HB0  ; Write alarm distance; read alarm register
+SONARINT: EQU &HB1  ; Write mask for sonar interrupts
+SONAREN:  EQU &HB2  ; register to control which sonars are enabled
+XPOS:     EQU &HC0  ; Current X-position (read only)
+YPOS:     EQU &HC1  ; Y-position
+THETA:    EQU &HC2  ; Current rotational position of robot (0-359)
+RESETPOS: EQU &HC3  ; write anything here to reset odometry to 0
+;RESETXY:  EQU &HC4	; leave theta intact
+
+
+A: 			DW &H0000
+B:			DW &H0000
+C:			DW &H0000
+D:			DW &H0000
+PNow:	    DW &H0000
+ANow:	    DW &H0000
+Corr: 		DW 0				; Value to store correction value for iterative theta
+CCounter:	DW 0				; What Command number are we on? Start at 0 and +1 on init. used to map P(N) and A(N) to PNow and ANow each loop
+Xtemp:		DW &H0000			; Holders for loop starting coords
+YTemp:		DW &H0000			;
+Delta1:		DW &H0000			; Var to store XPOS-Xtemp
+Delta2:		DW &H0000
+
+
+DeadZone:   DW 2 					; Below this # of degrees do not correct, try 1 deg later
+;
+;A1:			    DW &H0000
+A1:			    DW -600
+DX1:			DW &H0000
+DY1:			DW &H0000
+P1:			    DW 30
+;;;P1:			    DW &H0000
+;
+A2:			    DW -600
+DX2:			DW &H0000
+DY2:			DW &H0000
+P2:			    DW -30
+;
+A3:			    DW -600
+DX3:			DW &H0000
+DY3:			DW &H0000
+P3:			    DW 50
+;
+A4:			    DW -600
+DX4:			DW &H0000
+DY4:			DW &H0000
+P4:			    DW -50
+
+;LUT0:   	DW 0     
+LUT1:   	DW 50           
+LUT2:   	DW 100           
+;LUT3:   	DW 150  
+           
+;LUT4:   	DW 0
+LUT5:   	DW 25          
+LUT6:   	DW 50           
+;LUT7:   	DW 75          
+
+CHECK1: 	DW 51
+CHECK2: 	DW 101
+
+NUM:		DW -90
+DEN:		DW 2
+
+C12:		DW 2
+C23:		DW 2
+C34:		DW 2
+
+
+X:			DW 50000
